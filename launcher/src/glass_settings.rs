@@ -464,6 +464,20 @@ impl Launcher {
         let about = card()
             .child(index_row(
                 0,
+                "Not affiliated",
+                Some(
+                    div()
+                        .child(
+                            "Horizon Local is an unofficial community build. It is not affiliated \
+                             with the Horizon developers, Mojang, or Microsoft.",
+                        )
+                        .into_any_element(),
+                ),
+                None,
+                &t,
+            ))
+            .child(index_row(
+                0,
                 tr("Data folder"),
                 Some(mono(short(&backend::data_dir()))),
                 Some(

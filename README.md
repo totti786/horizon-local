@@ -1,3 +1,16 @@
+> [!WARNING]
+> **Horizon Local is an unofficial community fork.** It is not affiliated with, endorsed by, or
+> supported by the Horizon developers, Mojang, or Microsoft.
+>
+> It keeps local/offline play with **your own** Minecraft assets, without Microsoft profile
+> authentication. You still need your own legitimate game files.
+>
+> Download builds from [RELEASES](https://github.com/totti786/horizon-local/releases/latest).
+>
+> Everything below this warning is upstream's README.
+
+<br><br><br><br>
+
 <p align="center">
   <img src="docs/media/banner.webp" alt="Horizon: the game you know, rebuilt in Rust" width="100%">
 </p>
