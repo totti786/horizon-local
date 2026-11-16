@@ -7,7 +7,7 @@
 //! output.
 //!
 //! The owner gate ([`launch`]): the launcher starts the game only while an account in it owns
-//! Minecraft: Java Edition, as other launchers do. Offline names play behind such an account.
+//! Minecraft: Java Edition, as other launchers do, and the game plays as the selected account.
 //! The game binary itself, its harnesses and the servers don't go through the launcher's gate.
 //!
 //! The Azure app (client ID) is Horizon's own and is configuration: `HORIZON_MSA_CLIENT_ID` at
@@ -16,6 +16,7 @@ pub mod session;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -74,17 +75,59 @@ impl Endpoints {
     }
 }
 
+/// Orders resolved addresses so the two families alternate, the first one's address first (the
+/// order RFC 8305 asks a client to try them in). A host whose IPv6 route is dead then costs one
+/// short attempt before its IPv4 address is tried, instead of every AAAA record in turn.
+fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = addrs.first().map(SocketAddr::is_ipv6) else {
+        return addrs;
+    };
+    let (mut same, mut other): (Vec<_>, Vec<_>) =
+        addrs.into_iter().partition(|a| a.is_ipv6() == first);
+    same.reverse();
+    other.reverse();
+    let mut out = Vec::with_capacity(same.len() + other.len());
+    while !same.is_empty() || !other.is_empty() {
+        out.extend(same.pop());
+        out.extend(other.pop());
+    }
+    out
+}
+
+/// The system's resolver with its answer interleaved (`interleave`).
+struct Interleaved<R>(R);
+
+impl<R: ureq::Resolver> ureq::Resolver for Interleaved<R> {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        self.0.resolve(netloc).map(interleave)
+    }
+}
+
+struct System;
+
+impl ureq::Resolver for System {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        netloc.to_socket_addrs().map(Iterator::collect)
+    }
+}
+
+/// The agent builder sign-in requests start from: the launcher's user agent, a 20 s timeout, a
+/// 10 s connect timeout (shared between the addresses, so a dead IPv6 route falls back to IPv4
+/// long before the 20 s run out) and addresses of both families interleaved.
+fn builder() -> ureq::AgentBuilder {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(20))
+        .timeout_connect(Duration::from_secs(10))
+        .resolver(Interleaved(System))
+        .user_agent(&format!("horizon-launcher/{}", crate::backend::VERSION))
+}
+
 /// A request to `url`: the launcher's user agent, a 20 s timeout, and the player's proxy when one
 /// is set (`proxy`), since a sign-in has to get out the way downloads do.
 fn request_to(method: &str, url: &str) -> ureq::Request {
-    crate::proxy::agent(
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(20))
-            .user_agent(&format!("horizon-launcher/{}", crate::backend::VERSION)),
-        url,
-    )
-    .build()
-    .request(method, url)
+    crate::proxy::agent(builder(), url)
+        .build()
+        .request(method, url)
 }
 
 /// One request's result: the status and the JSON body (empty when there is none). Transport
@@ -184,8 +227,14 @@ pub fn device_code(ep: &Endpoints, client_id: &str) -> Result<DeviceCode, String
                 .get("interval")
                 .and_then(Value::as_u64)
                 .unwrap_or(5)
-                .max(1),
-            expires_at: now() + v.get("expires_in").and_then(Value::as_u64).unwrap_or(900),
+                .clamp(1, 60),
+            // The service's numbers, bounded: Instant + a huge interval panics the sign-in thread.
+            expires_at: now().saturating_add(
+                v.get("expires_in")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(900)
+                    .min(3600),
+            ),
             device_code,
         }),
         _ => Err(oauth_error(&v)),
@@ -259,7 +308,7 @@ pub fn wait_for_sign_in(
         }
         match poll(ep, client_id, code)? {
             Poll::Pending => {}
-            Poll::SlowDown => interval += 5,
+            Poll::SlowDown => interval = (interval + 5).min(60),
             Poll::Done(tokens) => return Ok(tokens),
         }
     }
@@ -345,7 +394,7 @@ fn minecraft_login(
     let (token, expires_in) = minecraft_token(ep, &format!("XBL3.0 x={uhs};{xsts_token}"))?;
     Ok(Minecraft {
         token,
-        expires_at: now() + expires_in,
+        expires_at: now().saturating_add(expires_in.min(7 * 86_400)),
         xuid,
     })
 }
@@ -652,6 +701,122 @@ impl SecretStore for MemoryStore {
     }
     fn operations(&self) -> &Mutex<()> {
         &self.1
+    }
+}
+
+/// How long a call to the system keyring may take before the launcher gives up on it (#12179). An
+/// unlock prompt the player is typing a password into counts as an answer still coming, so this is
+/// longer than a working keyring ever takes, short enough that Play says what is wrong.
+pub const KEYCHAIN_WAIT: Duration = Duration::from_secs(20);
+
+/// What the launcher says when the system keyring didn't answer within `wait`.
+pub fn keyring_no_answer(wait: Duration) -> String {
+    crate::i18n::trf(
+        "Your system keyring didn't answer within {seconds} seconds. Make sure it is running and unlocked, then restart the launcher.",
+        &[("seconds", &wait.as_secs().max(1).to_string())],
+    )
+}
+
+/// One call to a [`Bounded`] keyring: its answer, or that the caller gave up on it.
+struct Call<T> {
+    answer: Option<T>,
+    gave_up: bool,
+}
+
+/// A keyring whose calls give up after `wait` (#12179): a Secret Service that never answers (a
+/// stuck KWallet or GNOME Keyring daemon) otherwise holds the account lock forever, and Play stays
+/// on "Starting…" with nothing said. Each call runs on a thread of its own; one given up on keeps
+/// running there, and while it does, later calls fail at once instead of piling up behind it.
+pub struct Bounded {
+    keyring: std::sync::Arc<dyn SecretStore>,
+    wait: Duration,
+    /// Calls given up on that haven't come back yet.
+    stuck: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Bounded {
+    pub fn new(keyring: impl SecretStore + 'static, wait: Duration) -> Self {
+        Self {
+            keyring: std::sync::Arc::new(keyring),
+            wait,
+            stuck: Default::default(),
+        }
+    }
+
+    fn call<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&dyn SecretStore) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let no_answer = || {
+            let said = keyring_no_answer(self.wait);
+            eprintln!("Horizon: {said}");
+            Err(said)
+        };
+        if self.stuck.load(SeqCst) > 0 {
+            return no_answer();
+        }
+        let call = std::sync::Arc::new((
+            Mutex::new(Call::<Result<T, String>> {
+                answer: None,
+                gave_up: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let (keyring, stuck, theirs) = (self.keyring.clone(), self.stuck.clone(), call.clone());
+        let spawned = std::thread::Builder::new()
+            .name("keyring".into())
+            .spawn(move || {
+                let answer = f(keyring.as_ref());
+                let (slot, done) = &*theirs;
+                let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.gave_up {
+                    stuck.fetch_sub(1, SeqCst);
+                } else {
+                    slot.answer = Some(answer);
+                    done.notify_one();
+                }
+            });
+        if let Err(e) = spawned {
+            return Err(e.to_string());
+        }
+        let (slot, done) = &*call;
+        let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut slot, _) = done
+            .wait_timeout_while(slot, self.wait, |call| call.answer.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(answer) = slot.answer.take() {
+            return answer;
+        }
+        // Under the call's lock: the thread, when it ends, sees this and counts itself back.
+        slot.gave_up = true;
+        self.stuck.fetch_add(1, SeqCst);
+        drop(slot);
+        no_answer()
+    }
+}
+
+impl SecretStore for Bounded {
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        let key = key.to_string();
+        self.call(move |keyring| keyring.get(&key))
+    }
+    fn set(&self, key: &str, secret: &str) -> Result<(), String> {
+        let (key, secret) = (key.to_string(), secret.to_string());
+        self.call(move |keyring| keyring.set(&key, &secret))
+    }
+    fn delete(&self, key: &str) -> Result<(), String> {
+        let key = key.to_string();
+        self.call(move |keyring| keyring.delete(&key))
+    }
+    fn persistent(&self) -> bool {
+        self.keyring.persistent()
+    }
+    fn lock_file(&self) -> Option<PathBuf> {
+        self.keyring.lock_file()
+    }
+    fn operations(&self) -> &Mutex<()> {
+        self.keyring.operations()
     }
 }
 
@@ -1510,7 +1675,8 @@ fn keychain_or_why() -> Result<Box<dyn SecretStore>, String> {
         if std::env::var_os("HORIZON_NO_KEYCHAIN").is_some() {
             return Err("HORIZON_NO_KEYCHAIN is set.".into());
         }
-        SystemStore.get("probe").map(|_| Box::new(SystemStore) as _)
+        let keychain = Bounded::new(SystemStore, KEYCHAIN_WAIT);
+        keychain.get("probe").map(|_| Box::new(keychain) as _)
     }
     #[cfg(not(all(
         not(test),
@@ -1534,7 +1700,10 @@ pub fn store() -> &'static dyn SecretStore {
         .get_or_init(|| {
             #[cfg(all(not(test), any(target_os = "linux", target_os = "freebsd")))]
             if std::env::var_os("HORIZON_NO_KEYCHAIN").is_none() {
-                return Box::new(Layered::new(Box::new(SystemStore), FileStore::launcher()));
+                return Box::new(Layered::new(
+                    Box::new(Bounded::new(SystemStore, KEYCHAIN_WAIT)),
+                    FileStore::launcher(),
+                ));
             }
             keychain_or_why().unwrap_or_else(|why| {
                 let _ = NO_KEYCHAIN_WHY.set(why);
@@ -1637,7 +1806,39 @@ impl Accounts {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, text + "\n").map_err(|e| e.to_string())
+        // A new file renamed over the old one: a crash or a full disk mid-write leaves the old list,
+        // not an empty file that reads as no accounts at all.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, text + "\n").and_then(|()| std::fs::rename(&tmp, path))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+        Ok(())
+    }
+    /// Saves what a launch renewed (names, skins) into `accounts.json` as it is now, under the
+    /// accounts' lock: an account signed in or out while the services were asked stays so, where
+    /// saving this copy, loaded before, would undo it.
+    pub fn save_renewed(&self) -> Result<(), String> {
+        self.save_renewed_to(store(), &Self::path())
+    }
+    pub(crate) fn save_renewed_to(
+        &self,
+        store: &dyn SecretStore,
+        path: &Path,
+    ) -> Result<(), String> {
+        let _operation = session::lock(store)?;
+        let mut saved = Self::load_from(path);
+        for account in &self.accounts {
+            saved.update(account.clone());
+        }
+        if saved.selected().is_none() {
+            saved.selected = self
+                .selected
+                .clone()
+                .filter(|u| saved.accounts.iter().any(|a| &a.uuid == u));
+        }
+        saved.save_to(path)
     }
     pub fn selected(&self) -> Option<&Account> {
         let uuid = self.selected.as_ref()?;
@@ -1679,7 +1880,7 @@ impl Accounts {
         Ok(())
     }
     /// Whether an account here owned the game at its last check (the keychain's answer, no
-    /// request): what Play and offline names need.
+    /// request): what Play needs.
     pub fn has_owner(&self, store: &dyn SecretStore) -> bool {
         // The selected account first: it owning the game ends the search after one account's
         // item — every account's item read can ask for the keychain (macOS, #4912).
@@ -1687,6 +1888,15 @@ impl Accounts {
             .into_iter()
             .chain(self.accounts.iter().filter(|a| Some(*a) != self.selected()))
             .any(|a| secrets_in(store, &a.uuid).is_some_and(|s| s.owns))
+    }
+
+    /// Plays as the signed-in account `uuid`.
+    pub fn play_as(&mut self, uuid: &str) -> Result<(), String> {
+        if !self.accounts.iter().any(|a| a.uuid == uuid) {
+            return Err("That account isn't signed in.".into());
+        }
+        self.selected = Some(uuid.to_string());
+        Ok(())
     }
 
     /// Who plays now.
@@ -1699,15 +1909,8 @@ impl Accounts {
     }
 
     /// Plays as `who`: an account, an offline name (kept, only beside an account that owns the
-    /// game), or the game's own name.
-    pub fn play_as(&mut self, store: &dyn SecretStore, who: Player) -> Result<(), String> {
-        self.play_as_with(store, who, false)
-    }
-
-    /// [`Self::play_as`], where `offline_without_owner` (the window's hidden developer option,
-    /// `backend::Settings::dev_offline`) lets an offline name play without an account that owns
-    /// the game.
-    pub fn play_as_with(
+    /// game, unless `offline_without_owner`), or the game's own name.
+    pub fn play_as_player(
         &mut self,
         store: &dyn SecretStore,
         who: Player,
@@ -1802,8 +2005,7 @@ impl Accounts {
         }
     }
 
-    /// Sign out: the secrets leave the keychain, the account the list. Offline names stay, but
-    /// play only once an account that owns the game is back.
+    /// Sign out: the secrets leave the keychain, the account the list.
     pub fn remove(&mut self, store: &dyn SecretStore, uuid: &str) -> Result<(), String> {
         let _operation = session::lock(store)?;
         store.delete(uuid)?;
@@ -1816,18 +2018,29 @@ impl Accounts {
 }
 
 /// No account in the launcher owns Minecraft: Java Edition: the game must not start.
-#[derive(Debug, PartialEq)]
-pub struct NoOwner;
+#[derive(Debug, Default, PartialEq)]
+pub struct NoOwner {
+    /// Why a sign-in couldn't be read, when the keyring didn't give it (#12179), or why the
+    /// account that plays can't: what is said instead of the refusal, which would tell a
+    /// signed-in player to sign in.
+    pub keyring: Option<String>,
+}
 impl std::fmt::Display for NoOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{NEEDS_OWNER}.")
+        match &self.keyring {
+            Some(why) => write!(f, "{why}"),
+            None => write!(f, "{NEEDS_OWNER}."),
+        }
     }
 }
 
 impl NoOwner {
     /// The same refusal for the window, which has Settings rather than a command to name.
-    pub fn in_window() -> String {
+    pub fn in_window(&self) -> String {
         use crate::i18n::tr;
+        if let Some(why) = &self.keyring {
+            return why.clone();
+        }
         format!(
             "{}. {}",
             tr(NEEDS_OWNER),
@@ -1839,8 +2052,8 @@ impl NoOwner {
 /// The owner gate's pass for one launch.
 #[derive(Debug, Default)]
 pub struct Launch {
-    /// The selected account and its renewed session; none when an offline name plays, or when
-    /// its sign-in couldn't be renewed now (`offline` says why).
+    /// The selected account and its renewed session; none when its sign-in couldn't be renewed
+    /// now (`offline` says why).
     pub session: Option<(Account, Secrets)>,
     /// Why the selected account plays without its session this time.
     pub offline: Option<String>,
@@ -1876,13 +2089,31 @@ pub fn launch(
     order.sort_by_key(|a| Some(&a.uuid) != selected.as_ref());
     let mut pass = Launch::default();
     let mut owned = false;
+    let mut unreadable = None;
     for account in order {
         if owned {
             break;
         }
         let plays = Some(&account.uuid) == selected.as_ref();
         let operation = session::lock(store);
-        let Some(secrets) = secrets_in(store, &account.uuid) else {
+        let read = match store.get(&account.uuid) {
+            Ok(text) => text.and_then(|s| serde_json::from_str::<Secrets>(&s).ok()),
+            Err(why) => {
+                // Not "signed out": the keyring didn't say (#12179). With no owner, the refusal
+                // says this instead.
+                let said = crate::i18n::trf(
+                    "Can't read {name}'s sign-in: {why}",
+                    &[("name", &account.name), ("why", &why)],
+                );
+                eprintln!("Horizon: {said}");
+                if plays {
+                    pass.offline = Some(said.clone());
+                }
+                unreadable = Some(said);
+                continue;
+            }
+        };
+        let Some(secrets) = read else {
             if plays {
                 pass.offline = Some(format!(
                     "{} is no longer signed in on this computer. Sign in again.",
@@ -1933,24 +2164,36 @@ pub fn launch(
     if owned {
         Ok(pass)
     } else {
-        Err(NoOwner)
+        Err(NoOwner {
+            keyring: unreadable,
+        })
     }
 }
 
-/// The owner gate before the game starts. With the window's hidden developer option
-/// (`backend::Settings::dev_offline`, `offline_without_owner`) no owner is no refusal: the game
-/// starts offline, without a session and without an `owner`. Downloads never come through here:
-/// `backend::download_for_owner` asks [`launch`] itself, so the option never downloads the game.
+/// The owner gate before the game starts: [`launch`], where the account that plays (the selected
+/// one, else the first) must own the game itself, by the services' answer or, when they can't be
+/// asked, its last one. Never another account's ownership for a name of its own.
 pub fn launch_for_game(
     ep: &Endpoints,
     client_id: Option<&str>,
     store: &dyn SecretStore,
     accounts: &mut Accounts,
-    offline_without_owner: bool,
 ) -> Result<Launch, NoOwner> {
-    match launch(ep, client_id, store, accounts) {
-        Err(NoOwner) if offline_without_owner => Ok(Launch::default()),
-        pass => pass,
+    if accounts.selected().is_none() {
+        accounts.selected = accounts.accounts.first().map(|a| a.uuid.clone());
+    }
+    let pass = launch(ep, client_id, store, accounts)?;
+    let owns = accounts
+        .selected()
+        .and_then(|a| secrets_in(store, &a.uuid))
+        .is_some_and(|s| s.owns);
+    if owns {
+        Ok(pass)
+    } else {
+        // Why that account can't play (it doesn't own the game, signed out, an unread keyring).
+        Err(NoOwner {
+            keyring: pass.offline,
+        })
     }
 }
 
@@ -2187,36 +2430,41 @@ pub struct GameSession {
 }
 
 /// The owner gate for the game about to start, then the selected account's session in a file
-/// for it, and the other accounts' for its splitscreen players. `offline_without_owner`: see
-/// [`launch_for_game`].
-pub fn session_for_game(
-    game_home: &Path,
-    offline_without_owner: bool,
-) -> Result<GameSession, NoOwner> {
+/// for it, and the other accounts' for its splitscreen players.
+pub fn session_for_game(game_home: &Path) -> Result<GameSession, NoOwner> {
     let mut accounts = Accounts::load();
     let pass = launch_for_game(
         &Endpoints::live(),
         client_id().as_deref(),
         store(),
         &mut accounts,
-        offline_without_owner,
     )?;
     let env = split_sessions(
         game_home,
         &mut accounts,
         pass.session.as_ref().map(|(a, _)| a.uuid.as_str()),
     );
-    if let Err(e) = accounts.save() {
+    if let Err(e) = accounts.save_renewed() {
         eprintln!("Horizon: the accounts are not saved: {e}");
     }
     Ok(session_file(game_home, pass, env))
+}
+
+/// [`session_for_game`] as Horizon Local plays: when no account owns the game the gate refuses,
+/// and the game starts offline instead (`backend::OFFLINE_PLAY`), with the offline name the
+/// player picked. Downloads never come through here.
+pub fn session_for_play(game_home: &Path) -> Result<GameSession, NoOwner> {
+    match session_for_game(game_home) {
+        Err(_refused) if crate::backend::OFFLINE_PLAY => Ok(GameSession::default()),
+        pass => pass,
+    }
 }
 
 /// [`session_for_game`] for one launch as `who` (`play --account`, a signed-in account): who
 /// plays changes for this launch only, so several games can play as several accounts at once
 /// (#4952). What the services renewed (tokens, names, skins) is still kept; which account
 /// `account select` picked is not touched.
-pub fn session_for_game_as(game_home: &Path, who: &Player) -> Result<GameSession, String> {
+pub fn session_for_game_as(game_home: &Path, who: &str) -> Result<GameSession, String> {
     let mut accounts = Accounts::load();
     let pass = launch_as(
         &Endpoints::live(),
@@ -2225,7 +2473,7 @@ pub fn session_for_game_as(game_home: &Path, who: &Player) -> Result<GameSession
         &mut accounts,
         who,
     );
-    if let Err(e) = accounts.save() {
+    if let Err(e) = accounts.save_renewed() {
         eprintln!("Horizon: the accounts are not saved: {e}");
     }
     let pass = pass?;
@@ -2234,7 +2482,7 @@ pub fn session_for_game_as(game_home: &Path, who: &Player) -> Result<GameSession
         &mut accounts,
         pass.session.as_ref().map(|(a, _)| a.uuid.as_str()),
     );
-    if let Err(e) = accounts.save() {
+    if let Err(e) = accounts.save_renewed() {
         eprintln!("Horizon: the accounts are not saved: {e}");
     }
     Ok(session_file(game_home, pass, env))
@@ -2246,21 +2494,13 @@ fn launch_as(
     client_id: Option<&str>,
     store: &dyn SecretStore,
     accounts: &mut Accounts,
-    who: &Player,
+    who: &str,
 ) -> Result<Launch, String> {
-    let chosen = (
-        accounts.selected.clone(),
-        accounts.offline_selected.clone(),
-        accounts.offline.clone(),
-    );
+    let chosen = accounts.selected.clone();
     let pass = accounts
-        .play_as(store, who.clone())
-        .and_then(|()| launch(ep, client_id, store, accounts).map_err(|e| e.to_string()));
-    (
-        accounts.selected,
-        accounts.offline_selected,
-        accounts.offline,
-    ) = chosen;
+        .play_as(who)
+        .and_then(|()| launch_for_game(ep, client_id, store, accounts).map_err(|e| e.to_string()));
+    accounts.selected = chosen;
     pass
 }
 
@@ -2286,7 +2526,7 @@ fn split_sessions(
     playing: Option<&str>,
 ) -> Vec<(&'static str, String)> {
     if splitscreen_on(game_home) {
-        // The launch may override the saved player, or play with an offline name.
+        // The launch may override the saved player.
         let selected = std::mem::replace(&mut accounts.selected, playing.map(str::to_owned));
         let env = account_sessions(
             &Endpoints::live(),
@@ -2433,7 +2673,7 @@ pub fn java_player() -> Result<crate::java_launch::Player, String> {
         store(),
         &mut accounts,
     );
-    if let Err(e) = accounts.save() {
+    if let Err(e) = accounts.save_renewed() {
         eprintln!("Horizon: the accounts are not saved: {e}");
     }
     player
@@ -2456,7 +2696,7 @@ fn java_player_with(
         .session
         .or(pass.owner)
         .or_else(kept)
-        .ok_or_else(|| NoOwner.to_string())?;
+        .ok_or_else(|| NoOwner::default().to_string())?;
     Ok(crate::java_launch::Player {
         name: account.name,
         uuid: account.uuid,

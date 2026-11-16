@@ -283,7 +283,7 @@ mod tests {
     use super::super::super::{ServerVersion, translate};
     use super::*;
     use crate::State;
-    use horizon_world::nbt::Tag;
+    use horizon_core::nbt::Tag;
 
     fn ids() -> &'static Ids {
         ServerVersion::V26_2.ids().unwrap()
@@ -389,7 +389,12 @@ mod tests {
             assert_eq!(s[1].states.get(330), 13330);
             assert_eq!(c.block_entities[0].kind, 0);
         }
-        let back = translate::chunk(ids, &old).unwrap();
+        let back = translate::chunk(
+            &crate::adapter::session::Session::new(crate::adapter::ServerVersion::V26_2),
+            ids,
+            &old,
+        )
+        .unwrap();
         let q = play::LevelChunkWithLight::read(&mut Reader::new(&back)).unwrap();
         assert_eq!((q.x, q.z), (3, -7));
         assert_eq!(q.chunk.heightmaps, p.chunk.heightmaps);

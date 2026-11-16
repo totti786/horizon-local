@@ -1,28 +1,24 @@
 # Syncing Horizon Local with upstream
 
 The fork follows `horizon-rust/horizon` and keeps a few launcher patches of its own. An upstream
-rebase replaces `.github/workflows/` wholesale, so every sync must restore the fork's workflow
-again.
+sync replaces `.github/workflows/` wholesale, so every sync must restore the fork's workflow again.
 
 ## Steps
 
 1. `git fetch upstream`
-2. `git checkout -b new-upstreamN upstream/main`
-3. Cherry-pick the README commit (`Man that ai really doesnt love saving readme`).
-4. Reapply the launcher patches (see the list below).
-5. Bump `launcher/Cargo.toml` (`version = "0.2.X"`) and the `horizon-launcher` entry in
+2. `git merge upstream/main` on `main` (a merge, not a rebase: the fork's history and its
+   published commits stay as they are).
+3. Resolve conflicts:
+   - `.github/workflows/`: keep only the fork's `launcher.yml`; `git rm` every upstream workflow.
+   - `launcher/lang/*.json`: take upstream's file and re-add the fork's key
+     `"couldn't check for updates: {error}"` after the opening `{`.
+   - The launcher patches below: take upstream's code where it moved, and re-apply the fork's
+     behaviour in its new home (upstream restructures the launcher often).
+4. Bump `launcher/Cargo.toml` (`version = "0.2.X"`) and the `horizon-launcher` entry in
    `launcher/Cargo.lock`. The workflow tags `launcher@X.Y.Z` from that version.
-6. Delete every upstream workflow and restore the fork's:
-   ```sh
-   git rm -q .github/workflows/*.yml
-   git checkout <fork-workflow-commit> -- .github/workflows/launcher.yml
-   ```
-   `launcher.yml` builds and releases the launcher for Windows (x64 + ARM64), Linux (x86_64) and
-   macOS (arm64 + x64) on every push to `main`, and skips a version whose release already exists.
-   The ARM64 Windows job is optional: if its runner fails, the other platforms still publish.
-7. `cargo fmt`, `cargo check`, `cargo test --lib --bins` in `launcher/`.
-8. Commit, fast-forward `main`, force-push, and let the workflow publish.
-9. If a build fails with "The job was not acquired by Runner of type hosted even after multiple
+5. `cargo fmt`, `cargo check --all-targets`, `cargo test --lib --bins` in `launcher/`.
+6. Commit the merge, push `main`, and let the workflow publish.
+7. If a build fails with "The job was not acquired by Runner of type hosted even after multiple
    attempts" (GitHub's macOS capacity), rerun just that job; the version is not released yet, so
    nothing gets published twice:
    ```sh
@@ -37,20 +33,31 @@ again.
   is reported (`Updates::launcher_error`) instead of reading as "up to date".
 - `backend::OFFLINE_PLAY = true`: offline play in the window and the CLI, no Microsoft account
   that owns the game.
-- `Settings::load()` and `client_as()` force `dev_offline` / `session_for_game(.., true)`.
-- CLI `account offline NAME`, `account select NAME` and `play` bypass the owner gate.
+- `account::session_for_play()` is the gate both the window (`launcher_play.rs`) and the CLI/MCP
+  (`backend/developer_play.rs`) use: when the owner gate refuses, the game starts offline instead.
+  Downloads still go through `account::launch` and need an owner. Upstream removed
+  `Settings::dev_offline` and the boolean argument to `session_for_game`; the fork does not need
+  them.
+- Offline names and their skins are kept though upstream removed them: the `Accounts.offline`,
+  `offline_selected` and `looks` fields, `account::Player`, `play_as_player`, `look`, `look_env`
+  and `name_arg`, `launcher/src/skins.rs`, the CLI's `account offline NAME`, `account select
+  NAME`, `account skin` and `account forget-offline`, and the top bar's quick switch and
+  Settings' offline rows (`switch_page.rs`, `blocks_settings.rs::offline_rows`). The game still
+  reads `--name`, `HORIZON_OFFLINE_SKIN` and `HORIZON_OFFLINE_CAPE`, so this stays compatible.
 - Signature check disabled for fork releases (`signed_digest` returns nothing, `download()`
   skips the check when the digest is empty). `fill_stage` then stores the archive's own SHA-256,
   so `place_checked` still refuses bytes that changed after the download; keep that.
 - No Microsoft plates: `frame.rs` top-bar sign-in, `glass_account.rs` Microsoft card,
-  `main.rs` `account_rows` and prepare sign-in.
-- `Horizon Local` link in the glass sidebar, above the Discord button (`frame.rs`), and the legacy
-  sidebar link (`main.rs`).
-- The README warning block and the "Not affiliated" row in the launcher's About section.
+  `blocks_play.rs` prepare sign-in and the gate row, `blocks_settings.rs` `account_rows` (offline
+  names instead), and the switch page's "who plays" chip.
+- `Horizon Local` link in the glass sidebar, above the Discord button (`blocks_chrome.rs`).
+- The README warning block and the "Not affiliated" rows in Settings' About (`blocks_settings.rs`
+  and `glass_settings.rs`).
 
-`launcher/tests/owner_gate.rs` is upstream's: it asserts that `play` and the MCP server refuse
-without an owner, which the fork removes on purpose, so `cargo test` fails those two and nothing
-else. `cargo test --lib --bins` is the suite the fork checks.
+`launcher/tests/owner_gate.rs` is upstream's test of the gate: the fork rewrote its two cases to
+assert the fork's policy (the CLI and the MCP server get past the gate and only ask for a
+prepared game), so `cargo test` stays green. `cargo test --lib --bins --tests` is the suite the
+fork checks.
 
 The game itself still updates from `horizon-rust/horizon` (`backend::REPO`): the fork builds and
 releases the launcher only.

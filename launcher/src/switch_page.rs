@@ -1,5 +1,6 @@
-//! Who plays: the top bar's quick switch (a menu under the account chip) and Settings' offline
-//! names (`horizon_launcher::account::Accounts::offline`).
+//! Who plays: the top bar's quick switch (a menu under the account chip) between the signed-in
+//! Microsoft accounts and, as Horizon Local plays without one, the offline names
+//! (`horizon_launcher::account::Accounts::offline`).
 use super::servers_page::Field;
 use super::*;
 use horizon_launcher::account::Player;
@@ -25,7 +26,7 @@ impl Launcher {
     pub(super) fn play_as(&mut self, who: Player) {
         let mut accounts = Accounts::load();
         let done = accounts
-            .play_as_with(account::store(), who, self.settings.dev_offline)
+            .play_as_player(account::store(), who, backend::OFFLINE_PLAY)
             .and_then(|()| accounts.save());
         match done {
             Ok(()) => self.accounts = accounts,
@@ -62,90 +63,12 @@ impl Launcher {
         out
     }
 
-    /// The menu under the account chip, while open.
-    pub(super) fn account_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.account_menu {
-            return None;
+    /// The face a player wears in the menus: the account's head, or the offline name's.
+    pub(super) fn player_face(who: &Player) -> Option<&str> {
+        match who {
+            Player::Microsoft(uuid) => Some(uuid),
+            Player::Offline(_) | Player::GameName => None,
         }
-        let t = self.theme;
-        let now = self.accounts.player();
-        let mut menu = div()
-            .id("account-menu")
-            .absolute()
-            .top(px(46.))
-            .right_0()
-            .w(px(280.))
-            .p(px(6.))
-            .border_2()
-            .border_color(t.outline)
-            .bg(t.surface)
-            .flex()
-            .flex_col()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.account_menu = false;
-                this.menu_closed_at = Some(event.position);
-                cx.notify();
-            }));
-        for (i, (who, name, how)) in self.players().into_iter().enumerate() {
-            let chosen = who == now;
-            menu = menu.child(
-                div()
-                    .id(SharedString::from(format!("account-pick-{i}")))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.))
-                    .h(px(46.))
-                    .px(px(10.))
-                    .rounded(px(theme::RADIUS))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(t.plate_soft))
-                    .child(self.profile_heads.draw(
-                        match &who {
-                            Player::Microsoft(uuid) => Some(uuid),
-                            _ => None,
-                        },
-                        24.,
-                        self.scale,
-                        &t,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(text(theme::LABEL).truncate().text_color(t.ink).child(name))
-                            .child(text(theme::CAPTION).text_color(t.muted).child(how)),
-                    )
-                    .when(chosen, |d| d.child(div().size(px(6.)).bg(t.accent)))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.play_as(who.clone());
-                        cx.notify();
-                    })),
-            );
-        }
-        menu = menu.child(div().my(px(6.)).h(px(1.)).bg(t.rule)).child(
-            div()
-                .id("account-manage")
-                .flex()
-                .items_center()
-                .h(px(32.))
-                .px(px(10.))
-                .rounded(px(theme::RADIUS))
-                .text_size(px(theme::LABEL.px))
-                .text_color(t.muted)
-                .cursor_pointer()
-                .hover(move |s| s.bg(t.plate_soft).text_color(t.ink))
-                .child(tr("Manage accounts"))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.account_menu = false;
-                    this.go(Page::Settings);
-                    cx.notify();
-                })),
-        );
-        Some(gpui::deferred(menu).with_priority(1))
     }
 
     fn add_offline_name(&mut self) {
@@ -196,15 +119,6 @@ impl Launcher {
                     ),
                 );
             }
-            let dressed = name.clone();
-            actions = actions.child(
-                button(format!("offline-skin-{i}"), "Skin…", Kind::Ghost, &t).on_click(
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.open_skin(dressed.clone());
-                        cx.notify();
-                    }),
-                ),
-            );
             let forget = name.clone();
             actions = actions.child(
                 button(format!("offline-forget-{i}"), "Forget", Kind::Ghost, &t).on_click(
@@ -231,7 +145,6 @@ impl Launcher {
                 &t,
             ));
         }
-        rows = rows.children(self.skin_panel(cx));
         // The name the game made up can't be forgotten — it's what an offline player is —
         // only rolled for a new one.
         if let Some(made_up) = self.offline_name.clone() {
@@ -293,4 +206,101 @@ impl Launcher {
         ));
         (rows, n)
     }
+
+    /// The menu under the account chip, while open.
+    pub(super) fn account_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.account_menu {
+            return None;
+        }
+        let t = self.theme;
+        let now = self.accounts.player();
+        let mut menu = div()
+            .id("account-menu")
+            .absolute()
+            .top(px(46.))
+            .right_0()
+            .w(px(280.))
+            .p(px(6.))
+            .border_2()
+            .border_color(t.outline)
+            .bg(t.surface)
+            .flex()
+            .flex_col()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.account_menu = false;
+                this.menu_closed_at = Some(event.position);
+                cx.notify();
+            }));
+        for (i, (who, name, how)) in self.players().into_iter().enumerate() {
+            let chosen = now == who;
+            let face = Self::player_face(&who).map(str::to_owned);
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("account-pick-{i}")))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .h(px(46.))
+                    .px(px(10.))
+                    .rounded(px(theme::RADIUS))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(t.plate_soft))
+                    .child(
+                        self.profile_heads
+                            .draw(face.as_deref(), 24., self.scale, &t),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(text(theme::LABEL).truncate().text_color(t.ink).child(name))
+                            .child(text(theme::CAPTION).text_color(t.muted).child(how)),
+                    )
+                    .when(chosen, |d| d.child(div().size(px(6.)).bg(t.accent)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.play_as(who.clone());
+                        cx.notify();
+                    })),
+            );
+        }
+        menu = menu.child(div().my(px(6.)).h(px(1.)).bg(t.rule)).child(
+            div()
+                .id("account-manage")
+                .flex()
+                .items_center()
+                .h(px(32.))
+                .px(px(10.))
+                .rounded(px(theme::RADIUS))
+                .text_size(px(theme::LABEL.px))
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover(move |s| s.bg(t.plate_soft).text_color(t.ink))
+                .child(tr("Manage accounts"))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.account_menu = false;
+                    this.go(Page::Settings);
+                    cx.notify();
+                })),
+        );
+        Some(gpui::deferred(menu).with_priority(1))
+    }
+}
+
+/// The name the game made up for a player without an account, once it has run.
+pub(super) fn offline_name() -> Option<String> {
+    player_name(&std::fs::read_to_string(backend::game_home().join("horizon-player.txt")).ok()?)
+}
+
+/// The name in `horizon-player.txt`: the game writes `name:Player12345` (horizon-client's
+/// offline_name.rs).
+fn player_name(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("name:"))
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
 }

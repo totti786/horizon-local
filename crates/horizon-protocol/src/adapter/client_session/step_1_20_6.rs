@@ -5,12 +5,12 @@
 //! client's use_item gets the head's yaw and pitch, which 1.21 reads and 1.20.6 does not send.
 //!
 //! The pinned ids are renumbered down before this step, so the stacks are in the client's numbering; their components
-//! are measured with the stack codec under `ids` renumbered up, as [`translate::v1_20_6::slot`] does.
+//! are measured with the stack codec under `ids` renumbered up, as [`translate::client_layout_v1_20_6::slot`] does.
 use crate::{
     Result, State,
     adapter::{
         ids::{self, Ids, Way},
-        translate::v1_20_6::{LEVEL_PARTICLES_HEAD, slot},
+        translate::client_layout_v1_20_6::{LEVEL_PARTICLES_HEAD, slot},
     },
     buf::{Codec, Reader, Writer},
     ids as packet_ids,
@@ -34,8 +34,32 @@ pub(super) fn clientbound(
         cb::EXPLODE => Some(explode(payload)?),
         cb::PROJECTILE_POWER => Some(projectile_power(payload)?),
         cb::MERCHANT_OFFERS => Some(merchant_offers(payload, ids)?),
+        cb::UPDATE_ATTRIBUTES => Some(update_attributes(payload)?),
         _ => None,
     })
+}
+
+/// 1.21's update_attributes as 1.20.6's: a modifier is named by a UUID, not an identifier (vanilla's own
+/// modifiers keep their old UUIDs, any other gets `UUID.nameUUIDFromBytes` of its identifier).
+fn update_attributes(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut r = Reader::new(payload);
+    let mut w = Writer::new();
+    w.varint(r.varint()?);
+    let n = r.count(r.remaining())?;
+    w.varint(n as i32);
+    for _ in 0..n {
+        w.varint(r.varint()?);
+        w.f64(r.f64()?);
+        let m = r.count(r.remaining())?;
+        w.varint(m as i32);
+        for _ in 0..m {
+            let id = r.string(32767)?;
+            w.uuid(crate::item::v1_20_5::modifier_uuid(&id));
+            w.f64(r.f64()?);
+            w.varint(r.varint()?);
+        }
+    }
+    Ok(w.data)
 }
 
 /// The serverbound `use_item` the 1.20.6 client sent (`payload`, under the pinned id `id`) with the head's yaw and
@@ -169,6 +193,43 @@ fn trade_item(payload: &[u8], r: &mut Reader, ids: &'static Ids) -> Result<Vec<u
 }
 
 #[cfg(test)]
+mod attribute_tests {
+    use super::*;
+
+    /// A 1.20.6 client reads a modifier as UUID, amount, operation (wiki and minecraft-data 1.20.6 agree).
+    #[test]
+    fn a_1_20_6_client_gets_modifier_uuids() {
+        let mut w = Writer::new();
+        w.varint(9); // entity
+        w.varint(1);
+        w.varint(0); // armor
+        w.f64(0.0);
+        w.varint(1);
+        w.string("minecraft:armor.boots");
+        w.f64(3.0);
+        w.varint(0);
+        let out = update_attributes(&w.data).unwrap();
+        let mut r = Reader::new(&out);
+        assert_eq!(
+            (
+                r.varint().unwrap(),
+                r.varint().unwrap(),
+                r.varint().unwrap()
+            ),
+            (9, 1, 0)
+        );
+        assert_eq!(r.f64().unwrap(), 0.0);
+        assert_eq!(r.varint().unwrap(), 1);
+        assert_eq!(
+            r.uuid().unwrap(),
+            crate::item::v1_20_5::modifier_uuid("minecraft:armor.boots")
+        );
+        assert_eq!((r.f64().unwrap(), r.varint().unwrap()), (3.0, 0));
+        assert_eq!(r.remaining(), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     //! Each change written here is read back with `translate`'s 1.20.6 reader: the mirror, both ways.
     use super::*;
@@ -203,7 +264,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(Reader::new(&down).varint().unwrap(), 7);
-        let up = translate::v1_20_6::clientbound(&session, State::Play, id, &down)
+        let up = translate::client_layout_v1_20_6::clientbound(&session, State::Play, id, &down)
             .unwrap()
             .unwrap();
         assert_eq!(up, original);
@@ -244,7 +305,7 @@ mod tests {
         assert_eq!(r.varint().unwrap(), 2);
         assert_eq!(r.varint().unwrap(), 3);
         assert_eq!(r.string(32767).unwrap(), "minecraft:entity.generic.explode");
-        let up = translate::v1_20_6::clientbound(&session, State::Play, id, &down)
+        let up = translate::client_layout_v1_20_6::clientbound(&session, State::Play, id, &down)
             .unwrap()
             .unwrap();
         assert_eq!(up, original);
@@ -276,7 +337,7 @@ mod tests {
         v.f64(0.0);
         v.f64(3.0);
         v.f64(4.0);
-        let up = translate::v1_20_6::clientbound(&session, State::Play, id, &v.data)
+        let up = translate::client_layout_v1_20_6::clientbound(&session, State::Play, id, &v.data)
             .unwrap()
             .unwrap();
         let mut r = Reader::new(&up);
@@ -321,9 +382,10 @@ mod tests {
             let down = clientbound(State::Play, id, &original, ids)
                 .unwrap()
                 .unwrap();
-            let up = translate::v1_20_6::clientbound(&session, State::Play, id, &down)
-                .unwrap()
-                .unwrap();
+            let up =
+                translate::client_layout_v1_20_6::clientbound(&session, State::Play, id, &down)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(up, original);
         }
     }

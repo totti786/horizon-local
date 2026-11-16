@@ -130,6 +130,30 @@ pub fn adopt_icon(home: &Path, url: &str) {
     }
 }
 
+// A malformed preference must not invalidate unrelated instance metadata.
+fn saved_profile<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_mods::Profile>, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(deserializer)?).ok())
+}
+
+/// Which builds an instance's "latest" follows. Missing in a saved instance: Nightly, so nobody
+/// is moved to an older build.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    Stable,
+    #[default]
+    Nightly,
+}
+
+// An unknown channel must not invalidate unrelated instance metadata.
+fn saved_channel<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Channel>, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(deserializer)?).ok())
+}
+
 /// The player's choices about one instance.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
@@ -143,6 +167,20 @@ pub struct Meta {
     /// launcher's own version, which follows updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The builds "latest" means for it; missing is [`Channel::Nightly`].
+    #[serde(
+        default,
+        deserialize_with = "saved_channel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub channel: Option<Channel>,
+    /// This instance's saved native build choice; missing or unknown starts at Optimized.
+    #[serde(
+        default,
+        deserialize_with = "saved_profile",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub native_profile: Option<crate::native_mods::Profile>,
     /// Seconds played in it, every run started by the launcher (the window or `play`) added up.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub played_secs: u64,
@@ -245,6 +283,10 @@ pub struct Instance {
     pub group: Option<String>,
     /// Its pinned Horizon version, if any (`Meta::version`).
     pub version: Option<String>,
+    /// Which builds it follows when it keeps no version.
+    pub channel: Channel,
+    /// Its saved native build choice, or Optimized before the player chooses one.
+    pub native_profile: crate::native_mods::Profile,
     pub played: Duration,
     pub last_played: Option<SystemTime>,
     /// What runs around the game (`launch::wrap`).
@@ -288,6 +330,28 @@ impl Instance {
 /// by group and name.
 pub fn list() -> Vec<Instance> {
     list_in(&backend::game_home(), &backend::data_dir())
+}
+
+/// Rolls a new name for a player without an account, in every instance's `horizon-player.txt`
+/// (the game reads it). Horizon Local keeps an offline name of the player's own, too.
+pub fn new_player_name() -> Result<String, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let name = format!(
+        "Player{:05}",
+        (nanos ^ u64::from(std::process::id()).rotate_left(32)) % 100_000
+    );
+    for instance in list() {
+        if instance.home.is_dir() {
+            fs::write(
+                instance.home.join("horizon-player.txt"),
+                format!("name:{name}\n"),
+            )
+            .map_err(|e| format!("{}: {e}", instance.home.display()))?;
+        }
+    }
+    Ok(name)
 }
 
 fn list_in(game_home: &Path, data: &Path) -> Vec<Instance> {
@@ -347,6 +411,10 @@ fn list_in(game_home: &Path, data: &Path) -> Vec<Instance> {
                 icon: meta.icon,
                 group: meta.group,
                 version: meta.version,
+                channel: meta.channel.unwrap_or_default(),
+                native_profile: meta
+                    .native_profile
+                    .unwrap_or(crate::native_mods::Profile::Optimized),
                 played: Duration::from_secs(meta.played_secs),
                 last_played: meta
                     .last_played
@@ -404,6 +472,7 @@ pub fn delete_with_selection(query: &str) -> Result<(Instance, Result<(), String
     } else {
         Ok(())
     };
+    crate::storage::eviction::request_cleanup();
     Ok((gone, saved))
 }
 
@@ -455,7 +524,6 @@ const NOT_COPIED: &[&str] = &[
     "logs",
     "crash-reports",
     "sessions",
-    "telemetry",
     "mod-browser",
     ".horizon-cache",
     // Far terrain's copies of what servers sent, rebuilt as the instance plays.
@@ -555,6 +623,7 @@ fn create_in(
         let _ = fs::remove_dir_all(&dir);
         return Err(format!("Could not make {}: {e}", dir.display()));
     }
+    crate::run_leases::publish(&dir).map_err(crate::native_mods::cache_error)?;
     let mut store = Store::load(data);
     let meta = store.instances.entry(slug.clone()).or_default();
     meta.name = (name != slug).then(|| name.to_string());
@@ -704,38 +773,10 @@ fn follow_player(game_home: &Path, home: &Path) {
         let _ = fs::create_dir_all(to.parent().unwrap());
         let _ = fs::copy(consent, to);
     }
-    let no_ai = horizon_core::no_ai::is_on(game_home);
-    if horizon_core::no_ai::is_on(home) != no_ai {
-        let _ = horizon_core::no_ai::set(home, no_ai);
+    let no_ai = horizon_platform::no_ai::is_on(game_home);
+    if horizon_platform::no_ai::is_on(home) != no_ai {
+        let _ = horizon_platform::no_ai::set(home, no_ai);
     }
-}
-
-/// A fresh made-up name everywhere the game keeps one: `horizon-player.txt` is per game
-/// folder (`PLAYER_FILES`), so the same new name goes to the default home and every
-/// instance's — the player stays one player in its worlds. The file's `name:` line and the
-/// `Player` + five digits scheme are horizon-client's (`offline_name.rs`).
-pub fn new_player_name() -> Result<String, String> {
-    new_player_name_in(&backend::game_home(), &backend::data_dir())
-}
-
-fn new_player_name_in(game_home: &Path, data: &Path) -> Result<String, String> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let name = format!(
-        "Player{:05}",
-        (nanos ^ u64::from(std::process::id()).rotate_left(32)) % 100_000
-    );
-    for instance in list_in(game_home, data) {
-        if instance.home.is_dir() {
-            fs::write(
-                instance.home.join("horizon-player.txt"),
-                format!("name:{name}\n"),
-            )
-            .map_err(|e| format!("{}: {e}", instance.home.display()))?;
-        }
-    }
-    Ok(name)
 }
 
 #[path = "instances/switch.rs"]

@@ -65,7 +65,8 @@ The opening, then Play ([clip](docs/opening.webm)):
   modpack goes to the Modpacks page; installed packs show their source and checksum, with Update,
   **Update all** and Remove ([docs/mod-browser.md](../docs/mod-browser.md)).
 - **Modpacks**: import a Java modpack (a Modrinth `.mrpack`, a CurseForge zip, or a Prism,
-  MultiMC or CurseForge instance folder) and see its coverage report: per mod, ported, partial,
+  MultiMC or CurseForge instance folder; the page lists the ones other launchers keep on this
+  computer, each a click away) and see its coverage report: per mod, ported, partial,
   not yet or not needed, with the reason ([docs/modpacks.md](../docs/modpacks.md)). **Port**
   gets the jars of what this computer can port today (content mods with data and assets only)
   the player's own way: copied from a folder they have, or downloaded from the pack's own links
@@ -159,15 +160,11 @@ The opening, then Play ([clip](docs/opening.webm)):
   (`horizon_launcher::shortcut`). **Remove shortcut** moves it to the trash; it is found by the
   instance id inside it, so a rename doesn't lose it. `horizon-launcher instance shortcut
   [instance] [--remove]`; `HORIZON_LAUNCHER_DESKTOP` points it at another folder.
-- **Accounts and quick switch**: the top bar's account chip opens a menu of everyone who can play:
-  each signed-in Microsoft account, the offline names the player keeps, and the name the game
-  made up (`horizon-player.txt`). Picking one plays as it from the next Play. Offline names play
-  only while an account that owns the game is signed in ([Microsoft accounts](#microsoft-accounts));
-  signing the last one out keeps them, unplayable until one is back. Settings > Account
-  adds offline names (3 to 16 letters, digits or `_`; the game gets `--name`) and forgets them,
-  skin and cape files included, and rolls the game's made-up name for a new one; the Console's
-  Share log takes the names out of the log too. `horizon-launcher account offline
-  [NAME]`, `account select <name>` (an account or an offline name), `account forget-offline
+- **Accounts and quick switch**: the top bar's account chip opens a menu of the signed-in
+  Microsoft accounts. Picking one plays as it from the next Play; that account must own the game
+  ([Microsoft accounts](#microsoft-accounts)). There are no offline names: the project decided
+  that Horizon plays only with a Microsoft account that owns Minecraft: Java Edition. The
+  Console's Share log takes the account names out of the log. `horizon-launcher account select
   <name>`.
 - **Accent and Home background**: on top of Dark, Light or System, Settings > Launcher picks an
   accent (Horizon's violet, blue, teal, green, amber, red or pink, any hue, or any colour typed as
@@ -184,13 +181,6 @@ The opening, then Play ([clip](docs/opening.webm)):
   `launcher/lang/<code>.json`, English text to its translation, Horizon's own; a test fails when
   the code asks `tr("…")` for a string a table lacks, or a table keeps one the code dropped.
   `horizon-launcher settings language system|en|fr|ru|de|zh|es|uk|pl`.
-- **Skin and cape**: each offline name's **Skin…** in Settings > Account shows the front of its
-  skin and cape, takes a skin PNG (64×64, or the older 64×32) and a cape PNG (64×32), and picks
-  classic or slim arms. The launcher keeps copies in its `skins/` folder and gives the game
-  `HORIZON_OFFLINE_SKIN`, `HORIZON_OFFLINE_SKIN_MODEL` and `HORIZON_OFFLINE_CAPE` when that name
-  plays; the game draws the default skins until it reads them. A Microsoft account's skin and
-  cape: coming soon, with sign-in. `horizon-launcher account skin <name> [FILE] [--model
-  classic|slim] [--cape FILE] [--no-skin] [--no-cape]`.
 - **Console**: Home's Console shows the game's output of this run as it comes: a search (every
   word, any case), Follow to keep the newest line in view, Copy, and Open logs folder. Warnings
   and errors stand out. **Share log…** uploads the log to [mclo.gs](https://mclo.gs), a paste
@@ -269,6 +259,17 @@ page `servers.json` (the list), `servers/<name>/` (the servers created there) an
   launcher's own arguments, kept as `game_args` in `settings.json`, and apply the next time the
   game starts. `horizon-launcher game-args "<line>"` sets them too, and `play --arg <ARG>` passes
   one for a single run.
+- **Wasm compile budget** (game runtime, not a launcher preference):
+  `wasm.compile_timeout_secs:120` in the client's `options.txt` (the resolved
+  `--player-dir` when supplied, otherwise the selected instance) allows 120 seconds
+  per uncached module on the Unix child-compiler path. Remove the line for the
+  `5 + 300 / available_threads` seconds default. Invalid values publish a refusal
+  and exclude the wasm package's code and content rather than silently defaulting.
+  An unavailable/untrusted Unix cache or failed compiler refuses compilation instead
+  of dropping the deadline. Dedicated servers use
+  `"wasm.compile_timeout_secs" = "120"` under `server.toml`'s `[properties]`.
+  Restart the game/server after editing. Windows currently compiles in process
+  without this child deadline; see the [runtime reference](../docs/modding/src/how-to/wasm-mods.md#compilation-time-setting).
 - **Proxy**: when the internet here needs one (a school's, an office's, a country where a host is
   unreachable), Settings' Proxy takes the `http://host:port` or `socks5://host:port` address your
   proxy app listens on, and
@@ -285,6 +286,10 @@ page `servers.json` (the list), `servers/<name>/` (the servers created there) an
 
 Long pages, dialogs, the server console and data previews have a visible scrollbar when
 their content overflows. Drag the thumb or click the track to navigate without a mouse wheel.
+When the top bar's page tabs overflow, an arrow on a fading edge shows each side with more tabs
+(`src/nav_strip.rs`); the arrows go at the ends and when all tabs fit. They fade in and out over
+150 ms, and a click scrolls three quarters of the strip over 240 ms; another click goes on from where
+that one is headed, and the wheel stops it. Performance mode and reduced motion make both instant.
 
 Pages and Home's landscape fill the window as it resizes. The title bar is transparent over the
 launcher on every platform: Windows keeps native dragging, resizing, Snap, minimize,
@@ -311,8 +316,8 @@ every 0.2 tag counts as newer than all of those (docs/versioning.md). It downloa
 against the release's signed `SHA256SUMS`, and says "A new version is available" in the sidebar with
 **Update**: the window closes, the launcher's own file runs again as the installer (`apply-update`,
 `src/update_handoff.rs`), which waits for the window's process to exit, puts the new launcher in place (the
-binary, the `.app` bundle or the AppImage) and starts it. Closing the window with an update downloaded installs
-it the same way, so the next start is the new launcher. When the installer can't put it in place, the old
+binary, the `.app` bundle or the AppImage) and starts it. Nothing goes in without **Update**: closing the window
+drops a downloaded update, and the next start checks again. When the installer can't put it in place, the old
 launcher starts again and says why. Each process stages in its own folder, and the installer checks the signed
 SHA-256 again before anything goes in; when the launcher in place is already that version or newer, it changes
 nothing. Servers keep running through **Update**. A copy that can't replace itself says so at once and offers
@@ -398,7 +403,6 @@ and don't set `%ERRORLEVEL%` / `$LASTEXITCODE`. Scripts that need the exit code 
     horizon-launcher account sign-in                sign in in your browser with a code
     horizon-launcher account sign-out <name>
     horizon-launcher account select <name>          play as this account
-    horizon-launcher account offline                play without an account
     horizon-launcher instance [list]                the instances and their game folders (* = Play starts it)
     horizon-launcher instance create <name> [--copy <instance>]   empty, or a copy of one's worlds, options and packs
     horizon-launcher instance create <name> --minecraft <1.21.4|latest|latest-snapshot>   a Minecraft: Java Edition instance
@@ -491,8 +495,8 @@ MCP's `play`) says "Sign in with a Microsoft account that owns Minecraft: Java E
 and starts nothing. Settings → Accounts signs in: the launcher shows a code, you enter it at
 microsoft.com/link, and the launcher checks that the account owns the game. It asks again at every
 Play, with the token renewal; with no network the last answer stands, and a "doesn't own" blocks
-at once. The account also plays online-mode servers under your own name and skin; offline names
-play LAN and offline-mode servers beside it. The game binary started directly (`horizon-client`,
+at once. The account that plays must own the game itself, and it plays online-mode servers under
+your own name and skin, LAN and offline-mode servers too. The game binary started directly (`horizon-client`,
 `horizon-ctl launch`), the harnesses and the servers don't go through this check. Tokens live in the system keychain (Keychain,
 Credential Manager, or the Secret Service on Linux), never in a log or the command line;
 `accounts.json` in the data folder keeps only names and UUIDs. On Linux without a keychain they go
@@ -550,6 +554,22 @@ On Windows, `cargo test --bin horizon-launcher desktop_list_renders_the_viewport
 ## Building
 
     cargo build --release
+
+A debug build (`cargo build`) also supports Windows' default 1 MiB process-entry stack.
+On Windows, the entry thread starts and joins a launcher thread with a 16 MiB stack before
+any CLI dispatch or GUI initialization. That thread owns OLE initialization, GPUI's windows
+and its message loop together; Linux and macOS still run on the original main thread.
+CLI arguments, terminal pipes and command exit codes are unchanged.
+
+The Windows daily subprocess tests use the debug binary. To exercise real CLI startup with
+a deterministic 1 MiB entry stack, including persisted settings and failure exit codes:
+
+    cargo test --locked --test startup cli_settings_work_with_one_mib_process_stack -- --ignored --exact
+
+That test uses fresh homes and a private copy of the executable with only its PE stack reserve
+changed; it needs no desktop. The ignored
+`hardware_probes_run_hidden_after_the_first_frame` test additionally checks real GUI startup
+on an interactive Windows desktop with a graphics adapter.
 
 On NixOS, `nix-shell` in this folder provides the libraries GPUI links to (Wayland, X11,
 xkbcommon, Vulkan, fontconfig) and the ALSA and libudev files a native mod build looks up, so

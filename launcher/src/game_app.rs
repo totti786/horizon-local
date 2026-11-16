@@ -93,19 +93,45 @@ pub fn ensure(version: &Path) -> io::Result<PathBuf> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => remove_if_present(&to)?,
         Err(e) => return Err(e),
     }
-    sync_native_data(version, &programs)?;
+    for name in ["native-data", "native-content", "horizon-native-mods"] {
+        sync_native_directory(version, &programs, name)?;
+    }
+    for entry in fs::read_dir(version)? {
+        let entry = entry?;
+        if runtime_library(&entry.file_name().to_string_lossy()) {
+            let to = programs.join(entry.file_name());
+            if !same_file(&entry.path(), &to) {
+                replace_link(&to, |temp| fs::hard_link(entry.path(), temp))?;
+            }
+        }
+    }
+    // Remove retired runtime links, without touching unexpected directories.
+    for entry in fs::read_dir(&programs)? {
+        let entry = entry?;
+        if runtime_library(&entry.file_name().to_string_lossy())
+            && !version.join(entry.file_name()).exists()
+        {
+            remove_if_present(&entry.path())?;
+        }
+    }
     Ok(programs.join(PROGRAMS[0]))
 }
 
-fn sync_native_data(version: &Path, programs: &Path) -> io::Result<()> {
-    let present = match fs::metadata(version.join("native-data")) {
+// Runtime libraries installed by the native routes, the game's and each mod's own library; keep
+// bundle discovery in one place.
+fn runtime_library(name: &str) -> bool {
+    name.ends_with(".dylib")
+}
+
+fn sync_native_directory(version: &Path, programs: &Path, name: &str) -> io::Result<()> {
+    let present = match fs::metadata(version.join(name)) {
         Ok(m) if m.is_dir() => true,
         Ok(_) => return Err(io::ErrorKind::NotADirectory.into()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err(e),
     };
-    let to = programs.join("native-data");
-    let target = Path::new("../../../native-data");
+    let to = programs.join(name);
+    let target = Path::new("../../..").join(name);
     match fs::symlink_metadata(&to) {
         // Never replace or recursively delete an unexpected directory or file.
         Ok(m) if !m.file_type().is_symlink() => return Err(io::ErrorKind::AlreadyExists.into()),
@@ -115,7 +141,7 @@ fn sync_native_data(version: &Path, programs: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     if present {
-        replace_link(&to, |temp| std::os::unix::fs::symlink(target, temp))
+        replace_link(&to, |temp| std::os::unix::fs::symlink(&target, temp))
     } else {
         remove_if_present(&to)
     }
@@ -169,6 +195,41 @@ mod tests {
         fs::create_dir_all(&version).unwrap();
         fs::write(version.join("horizon-client"), "unchanged signed game").unwrap();
         version
+    }
+
+    #[test]
+    fn runtime_libraries_and_packages_follow_reinstalls() {
+        let version = native_version("runtime");
+        let library = version.join("libhorizon_mod_host.dylib");
+        fs::write(&library, b"old").unwrap();
+        fs::write(version.join("libstd-test.dylib"), b"std").unwrap();
+        fs::write(version.join("libhorizon_client.dylib"), b"game").unwrap();
+        fs::write(version.join("libexample.dylib"), b"mod").unwrap();
+        fs::create_dir_all(version.join("horizon-native-mods/example")).unwrap();
+        let program = ensure(&version).unwrap();
+        let bundled = program.with_file_name("libhorizon_mod_host.dylib");
+        assert!(same_file(&library, &bundled));
+        assert!(program.with_file_name("libstd-test.dylib").exists());
+        assert!(program.with_file_name("libhorizon_client.dylib").exists());
+        // A mod's library is found beside the bundled executable too.
+        assert!(program.with_file_name("libexample.dylib").exists());
+        assert!(program
+            .with_file_name("horizon-native-mods/example")
+            .is_dir());
+        fs::remove_file(&library).unwrap();
+        fs::write(&library, b"new").unwrap();
+        ensure(&version).unwrap();
+        assert_eq!(fs::read(&bundled).unwrap(), b"new");
+        fs::remove_file(&library).unwrap();
+        fs::rename(
+            version.join("horizon-native-mods"),
+            version.join("old-mods"),
+        )
+        .unwrap();
+        ensure(&version).unwrap();
+        assert!(!bundled.exists());
+        assert!(!program.with_file_name("horizon-native-mods").exists());
+        fs::remove_dir_all(version).unwrap();
     }
 
     #[test]
@@ -244,6 +305,27 @@ mod tests {
             fs::read(version.join("old-data/example/table.bin")).unwrap(),
             b"first"
         );
+        fs::remove_dir_all(version).unwrap();
+    }
+
+    #[test]
+    fn native_content_is_linked_beside_the_app_executable_and_removed_when_absent() {
+        let version = native_version("content");
+        let content = version.join("native-content/soundproof/assets/soundproof");
+        fs::create_dir_all(&content).unwrap();
+        fs::write(content.join("sounds.json"), b"{}").unwrap();
+        let linked = ensure(&version).unwrap().with_file_name("native-content");
+        assert_eq!(
+            fs::read_link(&linked).unwrap(),
+            Path::new("../../../native-content")
+        );
+        assert_eq!(
+            fs::read(linked.join("soundproof/assets/soundproof/sounds.json")).unwrap(),
+            b"{}"
+        );
+        fs::rename(version.join("native-content"), version.join("old-content")).unwrap();
+        ensure(&version).unwrap();
+        assert!(fs::symlink_metadata(linked).is_err());
         fs::remove_dir_all(version).unwrap();
     }
 

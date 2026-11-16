@@ -20,6 +20,7 @@ use horizon_cosmetics::prefs::{self, Others, Prefs};
 use horizon_cosmetics::{Item, Slot, Texture};
 use horizon_launcher::wardrobe::{Catalogue, Change, ClaimState, Error, Saved, Service, Session};
 use horizon_theme::glass::{fill, ink, radius};
+use servers_page::Field;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -103,13 +104,28 @@ fn game_language() -> &'static str {
     }
 }
 
-/// The account's skin as the preview takes it: from the profile heads' cache, 64×64 only (older
-/// 64×32 skins and missing ones show a plain figure).
-fn skin(account: &account::Account) -> Option<(Arc<Texture>, bool)> {
-    let (url, model) = account.skin.as_ref()?;
-    let png =
-        horizon_launcher::heads::cached_skin(url, &backend::data_dir().join("profile-heads"))?;
-    Some((skin_texture(&png)?, model == "slim"))
+/// The account's skin as the preview takes it, 64×64 only: its own from the profile heads'
+/// cache, else the default skin (Steve, Alex…) its UUID wears in the game, from the player's
+/// prepared game files in `resources`. None (a stand-in figure) when neither reads.
+fn skin(account: &account::Account, resources: &std::path::Path) -> Option<(Arc<Texture>, bool)> {
+    let own = account.skin.as_ref().and_then(|(url, model)| {
+        let cache = backend::data_dir().join("profile-heads");
+        let png = horizon_launcher::heads::cached_skin(url, &cache)?;
+        Some((skin_texture(&png)?, model == "slim"))
+    });
+    own.or_else(|| {
+        let (file, slim) = horizon_launcher::heads::default_skin_file(resources, &account.uuid)?;
+        Some((skin_texture(&std::fs::read(file).ok()?)?, slim))
+    })
+}
+
+/// Whether two skins are the same picture and arms.
+fn same_skin(a: &Option<(Arc<Texture>, bool)>, b: &Option<(Arc<Texture>, bool)>) -> bool {
+    match (a, b) {
+        (Some((a, x)), Some((b, y))) => x == y && a.rgba == b.rgba,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// A plain figure's texture, for an account without a skin the preview can read: head and arms,
@@ -401,6 +417,7 @@ impl Launcher {
         {
             return;
         }
+        let resources = self.game_resources();
         let keep = self.wardrobe.take().filter(|w| w.uuid == account.uuid);
         let saved = Saved::load(&dir(), &account.uuid);
         let slot = keep.as_ref().map_or("head", |w| w.slot);
@@ -413,7 +430,7 @@ impl Launcher {
             saved: saved.clone(),
             items: keep.map(|w| w.items).unwrap_or_default(),
             session: session.clone(),
-            skin: skin(&account),
+            skin: skin(&account, &resources),
             status: Status::Loading,
             busy: true,
             slot,
@@ -435,11 +452,18 @@ impl Launcher {
             if let Err(e) = trip.saved.save(&dir(), &account.uuid) {
                 eprintln!("Horizon: the outfit is not saved: {e}");
             }
-            trip
+            // The account's own skin may have reached the profile heads' cache meanwhile (its
+            // first download runs at start, beside this).
+            (trip, skin(&account, &resources))
         });
         cx.spawn(async move |this, cx| {
-            let trip = task.await;
+            let (trip, skin) = task.await;
             let _ = this.update(cx, |this, cx| {
+                if let Some(w) = this.wardrobe.as_mut() {
+                    if !same_skin(&w.skin, &skin) {
+                        w.skin = skin;
+                    }
+                }
                 this.wardrobe_back(trip, None);
                 cx.notify();
             });
@@ -502,12 +526,9 @@ impl Launcher {
         .detach();
     }
 
-    /// The account the page is for: the selected one, if it signed in with Microsoft.
+    /// The account the page is for: the selected one.
     fn wardrobe_account(&self) -> Option<account::Account> {
-        match self.accounts.player() {
-            account::Player::Microsoft(_) => self.accounts.selected().cloned(),
-            _ => None,
-        }
+        self.accounts.selected().cloned()
     }
 
     /// A trip came back: keep what it learnt, say how it went.
@@ -942,6 +963,15 @@ impl Launcher {
             return page.child(self.wardrobe_sign_in(cx));
         }
         let viewer = self.wardrobe_dress(cx);
+        let search = self
+            .field(Field::WardrobeSearch, tr("Search your cosmetics"), 280., cx)
+            .w_full();
+        let query = self
+            .servers
+            .value(Field::WardrobeSearch)
+            .trim()
+            .to_lowercase();
+        let searching = !query.is_empty();
         let Some(w) = self.wardrobe.as_ref() else {
             return page;
         };
@@ -1075,14 +1105,43 @@ impl Launcher {
                 }
             },
         ));
+        let turn = |id: &'static str, dx: f32, label: &'static str, cx: &mut Context<Self>| {
+            let arrow = ui::icon("arrow-right-01", 17., ui::white(ink::SOFT)).when(dx < 0., |i| {
+                i.with_transformation(gpui::Transformation::rotate(gpui::radians(
+                    std::f32::consts::PI,
+                )))
+            });
+            keyboard(
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(34.))
+                    .rounded(px(radius::CONTROL))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(ui::white(fill::HOVER)))
+                    .child(arrow),
+                &t,
+            )
+            .tooltip(ui::tip(tr(label)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if let Some(v) = this.wardrobe.as_ref().and_then(|w| w.viewer.clone()) {
+                    v.update(cx, |v, cx| v.turn(dx, cx));
+                }
+            }))
+        };
         let controls = div()
             .flex()
             .items_center()
-            .gap(px(12.))
+            .gap(px(8.))
+            .child(turn("wardrobe-turn-left", -90., "Turn left", cx))
             .child(
                 ui::text(12., FontWeight::NORMAL, ink::NOTE)
                     .child(tr("Drag to turn, scroll to zoom.")),
             )
+            .child(turn("wardrobe-turn-right", 90., "Turn right", cx))
             .child(reset);
         let player = glass::plate(radius::PANEL)
             .flex()
@@ -1138,9 +1197,13 @@ impl Launcher {
                         .hover(|s| s.bg(ui::white(0.08)))
                 })
                 .child(ui::text(14., FontWeight::MEDIUM, ink::FULL).child(title))
-                .child(ui::text(12., FontWeight::NORMAL, ink::NOTE).child(under))
+                .child(if on {
+                    purchases::chip(true, under).mt(px(2.)).self_start()
+                } else {
+                    ui::text(12., FontWeight::NORMAL, ink::NOTE).child(under)
+                })
         };
-        cards = cards.child(
+        let nothing = (!searching).then(|| {
             card(
                 format!("wardrobe-none-{slot}").into(),
                 tr("Nothing").into(),
@@ -1157,24 +1220,40 @@ impl Launcher {
                     cx,
                 );
                 cx.notify();
-            })),
-        );
-        for e in entries
-            .iter()
-            .filter(|e| e.slot == slot && me.owned.contains(&e.id))
-        {
+            }))
+        });
+        cards = cards.children(nothing);
+        let slot_label = |s: &str| SLOTS.iter().find(|(id, _)| *id == s).map(|x| (x.0, x.1));
+        let mut found = 0;
+        for e in entries.iter().filter(|e| me.owned.contains(&e.id)) {
+            let Some((slot, slot_name)) = slot_label(&e.slot) else {
+                continue;
+            };
+            let hit = if searching {
+                let name = e.name(lang).to_lowercase();
+                name.contains(&query) || tr(slot_name).to_lowercase().contains(&query)
+            } else {
+                slot == w.slot
+            };
+            if !hit {
+                continue;
+            }
+            found += 1;
+            let wearing = me.equipped.get(slot).cloned();
             let on = wearing.as_deref() == Some(e.id.as_str());
             let under = match (on, founder.contains(&e.id)) {
-                (true, _) => tr("Equipped"),
-                (false, true) => tr("Founder set"),
-                (false, false) => tr("Yours"),
+                (true, _) => tr("Equipped").to_string(),
+                // While searching, each card says which slot it goes in.
+                (false, _) if searching => tr(slot_name).to_string(),
+                (false, true) => tr("Founder set").to_string(),
+                (false, false) => tr("Yours").to_string(),
             };
             let id = e.id.clone();
             cards = cards.child(
                 card(
                     format!("wardrobe-item-{}", e.id).into(),
                     e.name(lang).to_owned(),
-                    under.into(),
+                    under,
                     on,
                 )
                 .on_hover(Self::wardrobe_try_on(slot, Some(e.id.clone()), cx))
@@ -1197,7 +1276,19 @@ impl Launcher {
             .p(px(16.))
             .w(px(312.))
             .flex_none()
-            .child(ui::text(16., FontWeight::SEMIBOLD, ink::FULL).child(tr(label)))
+            .child(search)
+            .child(
+                ui::text(16., FontWeight::SEMIBOLD, ink::FULL).child(if searching {
+                    tr("Found").to_string()
+                } else {
+                    tr(label).to_string()
+                }),
+            )
+            .when(searching && found == 0, |d| {
+                d.child(ui::text(13., FontWeight::NORMAL, ink::NOTE).child(tr(
+                    "Nothing you own matches. Try another word, or look in the shop.",
+                )))
+            })
             .child(cards);
         let page = page
             .child(
